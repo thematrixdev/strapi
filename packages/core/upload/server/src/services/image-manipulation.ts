@@ -18,11 +18,15 @@ const { bytesToKbytes } = fileUtils;
 const FORMATS_TO_RESIZE = ['jpeg', 'png', 'webp', 'tiff', 'gif'];
 const FORMATS_TO_PROCESS = ['jpeg', 'png', 'webp', 'tiff', 'svg', 'gif', 'avif'];
 const FORMATS_TO_OPTIMIZE = ['jpeg', 'png', 'webp', 'tiff', 'avif'];
+const ANIMATED_FORMATS = ['webp', 'gif', 'png'];
 
 const isOptimizableFormat = (
   format: string | undefined
 ): format is 'jpeg' | 'png' | 'webp' | 'tiff' | 'avif' =>
   format !== undefined && FORMATS_TO_OPTIMIZE.includes(format);
+
+const isAnimatedFormat = (format: string | undefined): boolean =>
+  format !== undefined && ANIMATED_FORMATS.includes(format);
 
 const writeStreamToFile = (stream: NodeJS.ReadWriteStream, path: string) =>
   new Promise<void>((resolve, reject) => {
@@ -52,6 +56,20 @@ const getDimensions = async (file: UploadableFile): Promise<Dimensions> => {
   return { width, height };
 };
 
+const isAnimatedImage = async (file: UploadableFile): Promise<boolean> => {
+  try {
+    const metadata = await getMetadata(file);
+    if (!metadata.format || !isAnimatedFormat(metadata.format)) {
+      return false;
+    }
+    // Check if the image has multiple pages (frames)
+    const pageCount = metadata.pages || 1;
+    return pageCount > 1;
+  } catch (e) {
+    return false;
+  }
+};
+
 const THUMBNAIL_RESIZE_OPTIONS = {
   width: 245,
   height: 156,
@@ -71,17 +89,49 @@ const resizeFileTo = async (
 ) => {
   const filePath = file.tmpWorkingDirectory ? join(file.tmpWorkingDirectory, hash) : hash;
 
+  // Check if image is animated to preserve animation during resize
+  const isAnimated = await isAnimatedImage(file);
+
   let newInfo;
   if (!file.filepath) {
-    const transform = sharp()
-      .resize(options)
-      .on('info', (info) => {
-        newInfo = info;
-      });
+    let transform = sharp()
+      .resize(options);
+
+    // For animated images, enable animation preservation
+    if (isAnimated) {
+      // Get the metadata to determine the format
+      const metadata = await getMetadata(file);
+      if (metadata.format === 'gif') {
+        transform = transform.gif({ animated: true });
+      } else if (metadata.format === 'webp') {
+        transform = transform.webp({ animated: true });
+      } else if (metadata.format === 'png') {
+        transform = transform.png({ animated: true });
+      }
+    }
+
+    transform.on('info', (info) => {
+      newInfo = info;
+    });
 
     await writeStreamToFile(file.getStream().pipe(transform), filePath);
   } else {
-    newInfo = await sharp(file.filepath).resize(options).toFile(filePath);
+    let transformer = sharp(file.filepath).resize(options);
+    
+    // For animated images, enable animation preservation
+    if (isAnimated) {
+      // Get the metadata to determine the format
+      const metadata = await getMetadata(file);
+      if (metadata.format === 'gif') {
+        transformer = transformer.gif({ animated: true });
+      } else if (metadata.format === 'webp') {
+        transformer = transformer.webp({ animated: true });
+      } else if (metadata.format === 'png') {
+        transformer = transformer.png({ animated: true });
+      }
+    }
+    
+    newInfo = await transformer.toFile(filePath);
   }
 
   const { width, height, size } = newInfo ?? {};
@@ -125,12 +175,18 @@ const generateThumbnail = async (file: UploadableFile) => {
  *    - auto orienting image based on EXIF data
  *    - reduce image quality
  *
+ * Note: Animated images (GIF, WEBP, APNG) are skipped to preserve animation
  */
 const optimize = async (file: UploadableFile) => {
   const { sizeOptimization = false, autoOrientation = false } =
     (await getService('upload').getSettings()) ?? {};
 
   const { format, size } = await getMetadata(file);
+
+  // Skip optimization for animated images as it would strip animation
+  if (await isAnimatedImage(file)) {
+    return file;
+  }
 
   if ((sizeOptimization || autoOrientation) && isOptimizableFormat(format)) {
     let transformer;
@@ -307,6 +363,7 @@ export default {
   isOptimizableImage,
   isResizableImage,
   isImage,
+  isAnimatedImage,
   getDimensions,
   generateResponsiveFormats,
   generateThumbnail,
